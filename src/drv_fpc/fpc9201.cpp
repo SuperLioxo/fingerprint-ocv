@@ -295,27 +295,21 @@ protected:
             if (not ret) {
                 return send_signal("enroll-remove-and-retry", FALSE);
             }
-            
-            auto num_pixels = _fingerprint.total();
 
-            auto min_area = GET_OPTION(size_t, "min-area");
+            // Multi-template enrollment: each successful merge = 1 stage
+            _stage += 1;
+            auto num_templates = _fingerprint.count();
+            std::cout << "  stage=" << _stage << " templates=" << num_templates << std::endl;
 
-            auto rate =  (double)num_pixels / min_area;
-
-            std::cout << rate << std::endl;
-
-            if (num_pixels < min_area) {
-                int current_stage = (int)(rate * 10);
-                if (_stage < current_stage) {
-                    _stage += 1;
-                    return send_signal("enroll-stage-passed", FALSE);
-                }
-                return send_signal("enroll-remove-and-retry", FALSE);
+            // Check if we've collected enough templates
+            if ((int)num_templates >= MAX_TEMPLATES) {
+                std::cout << "  completed" << std::endl;
+                _storage->insert_or_update(std::move(_fingerprint));
+                _storage->save();
+                return send_signal("enroll-completed", TRUE);
             }
-            std::cout << "completed" << std::endl;
-            _storage->insert_or_update(std::move(_fingerprint));
-            _storage->save();
-            return send_signal("enroll-completed", TRUE);
+
+            return send_signal("enroll-stage-passed", FALSE);
 
         } else if (event._type == FPCEvent::FPP_EnrollVerifyStop) {
             return *this / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StopSensor, {}, {}}) / &WorkerEnrollVerify::async_return;
@@ -533,7 +527,7 @@ public:
 
         _device_name = device_id;
         _scan_type = "press";
-        _num_enroll_stages = 10;
+        _num_enroll_stages = MAX_TEMPLATES;
         _device_state._finger_present = false;
         _device_state._finger_needed = true;
 

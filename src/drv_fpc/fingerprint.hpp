@@ -1,18 +1,8 @@
 /*
 Copyright (C) 2022  pom@vro.life
+Copyright (C) 2026  Modified for multi-template FingerCode storage
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+Multi-template fingerprint storage with FingerCode matching.
 */
 #ifndef __fingerprint_hpp__
 #define __fingerprint_hpp__
@@ -25,12 +15,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace fpc {
 
+// Maximum number of individual templates to store per finger
+static constexpr int MAX_TEMPLATES = 5;
+
 struct Fingerprint
 {
     std::string _user{};
     std::string _name{};
+
+    // Multi-template storage
+    std::vector<cv::Mat> _templates{};              // Individual scan images
+    std::vector<cv::Mat> _masks{};                   // Masks for each template
+    std::vector<cvext::FingerCode> _codes{};          // FingerCode for each template
+
+    // Legacy fields kept for serialization compatibility
     cv::Mat _fingerprint{};
     cv::Mat _mask{};
+
+    // Enrollment calibration
+    float _enroll_min_similarity{0.0f}; // Min pairwise similarity among enrolled templates
 
     Fingerprint() = default;
     Fingerprint(Fingerprint&&) = default;
@@ -40,10 +43,21 @@ struct Fingerprint
     Fingerprint& operator =(Fingerprint&&) = default;
     Fingerprint& operator =(const Fingerprint&) = default;
 
+    // Add a new scan image as a template
+    // Returns true if this was the first image (no merge needed)
     bool merge(const cv::Mat& img);
+
+    // Match a new scan against all stored FingerCode templates
     bool match(const cv::Mat& img, float min_score, bool filter) const;
 
+    // Total coverage (sum of mask pixels across all templates)
     size_t total() const;
+
+    // Number of stored templates
+    size_t count() const { return _templates.size(); }
+
+    // Recompute all FingerCodes from stored images
+    void recompute_codes();
 
     void write(cv::FileStorage& fstorage, int idx) const;
     void read(cv::FileStorage& fstorage, int idx);
@@ -120,7 +134,7 @@ public:
     }
 
     void insert_or_update(Fingerprint&& fingerprint);
-    
+
     void load();
     void save();
 

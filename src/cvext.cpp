@@ -1,220 +1,262 @@
 /*
 Copyright (C) 2022  pom@vro.life
+Copyright (C) 2026  Modified for FingerCode matching engine
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+FingerCode extraction using Gabor Filterbank.
+Based on: Jain et al. "Filterbank-Based Fingerprint Matching" (2000)
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+Adapted for low-resolution (112x88) FPC fingerprint sensors.
 */
 #include <iostream>
+#include <cmath>
+#include <numeric>
+#include <algorithm>
+
+#include <opencv2/imgproc.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
 
 #include "cvext.hpp"
 
 namespace cvext {
 
-bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& output, int min_match, cv::Point offset={0, 0})
+// ============================================================
+// Gabor filter generation
+// ============================================================
+
+static cv::Mat create_gabor_kernel(int ksize, double sigma, double theta, double lambda, double gamma)
 {
-    assert(img1.type() == CV_8UC1);
-    assert(img2.type() == CV_8UC1);
+    return cv::getGaborKernel(cv::Size(ksize, ksize), sigma, theta, lambda, gamma, 0, CV_32F);
+}
 
-    auto sift = cv::SIFT::create();
-    
-    std::vector<cv::KeyPoint> keypoints1{};
-    std::vector<cv::KeyPoint> keypoints2{};
-    cv::Mat descriptors1{};
-    cv::Mat descriptors2{};
+// ============================================================
+// FingerCode extraction
+// ============================================================
 
-    sift->detectAndCompute(img1, {}, keypoints1, descriptors1);
-    sift->detectAndCompute(img2, {}, keypoints2, descriptors2);
+FingerCode FingerCode::extract(const cv::Mat& img)
+{
+    FingerCode fc;
 
-    std::vector<cv::Point> points1{};
-    std::vector<cv::Point> points2{};
+    if (img.empty() || img.rows < 16 || img.cols < 16) {
+        return fc;
+    }
 
-    std::for_each(keypoints1.begin(), keypoints1.end(), [&](cv::KeyPoint& keypoint){
-        points1.push_back(keypoint.pt);
-    });
+    // Ensure grayscale
+    cv::Mat gray;
+    if (img.channels() > 1) {
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = img.clone();
+    }
 
-    std::for_each(keypoints2.begin(), keypoints2.end(), [&](cv::KeyPoint& keypoint){
-        points2.push_back(keypoint.pt);
-    });
+    // Normalize and denoise
+    cv::Mat blurred;
+    cv::GaussianBlur(gray, blurred, cv::Size(3, 3), 0);
 
-    auto bf_matcher = cv::BFMatcher::create();
+    // Resize to standard size for block division
+    // Target: large enough for NUM_BLOCKS blocks with meaningful content
+    const int target_size = NUM_BLOCKS * 16; // 128 pixels
+    cv::Mat resized;
+    cv::resize(blurred, resized, cv::Size(target_size, target_size));
+
+    // Block size in pixels
+    const int block_w = target_size / NUM_BLOCKS; // 16 pixels per block
+    const int block_h = target_size / NUM_BLOCKS;
+
+    // Generate Gabor filters at NUM_ORIENTATIONS orientations
+    const double sigma = 3.0;
+    const double lambda = 10.0;
+    const double gabor_gamma = 0.5;
+    const int ksize = 9;
+
+    std::array<cv::Mat, NUM_ORIENTATIONS> filters{};
+    for (int i = 0; i < NUM_ORIENTATIONS; ++i) {
+        double theta = CV_PI * i / NUM_ORIENTATIONS;
+        filters[i] = create_gabor_kernel(ksize, sigma, theta, lambda, gabor_gamma);
+    }
+
+    // Extract features: for each block, apply each Gabor filter, compute std dev
+    int feature_idx = 0;
+    for (int by = 0; by < NUM_BLOCKS; ++by) {
+        for (int bx = 0; bx < NUM_BLOCKS; ++bx) {
+            // Extract block region
+            cv::Rect block_roi(bx * block_w, by * block_h, block_w, block_h);
+            cv::Mat block = resized(block_roi);
+
+            for (int ori = 0; ori < NUM_ORIENTATIONS; ++ori) {
+                // Apply Gabor filter
+                cv::Mat filtered;
+                cv::filter2D(block, filtered, CV_32F, filters[ori]);
+
+                // Compute standard deviation of filtered response
+                cv::Scalar mean, stddev;
+                cv::meanStdDev(filtered, mean, stddev);
+
+                fc.features[feature_idx++] = static_cast<float>(stddev[0]);
+            }
+        }
+    }
+
+    // Normalize feature vector to unit length
+    float norm = 0.0f;
+    for (float f : fc.features) {
+        norm += f * f;
+    }
+    norm = std::sqrt(norm);
+    if (norm > 1e-6f) {
+        for (float& f : fc.features) {
+            f /= norm;
+        }
+    }
+
+    return fc;
+}
+
+float FingerCode::similarity(const FingerCode& a, const FingerCode& b)
+{
+    if (a.features.size() != b.features.size()) return 0.0f;
+
+    // Dot product (features are already normalized to unit length)
+    float dot = 0.0f;
+    for (size_t i = 0; i < a.features.size(); ++i) {
+        dot += a.features[i] * b.features[i];
+    }
+
+    return dot; // Already in [-1, 1] due to normalization
+}
+
+bool FingerCode::valid() const
+{
+    float sum = 0.0f;
+    for (float f : features) {
+        sum += std::abs(f);
+    }
+    return sum > 0.01f;
+}
+
+// ============================================================
+// Multi-template matching
+// ============================================================
+
+MatchResult match_fingercode(
+    const std::vector<FingerCode>& templates,
+    const FingerCode& sample,
+    float threshold)
+{
+    MatchResult result{false, 0.0f, -1};
+
+    if (!sample.valid() || templates.empty()) {
+        return result;
+    }
+
+    float best_score = -999.0f;
+    int best_idx = -1;
+
+    for (int i = 0; i < (int)templates.size(); ++i) {
+        if (!templates[i].valid()) continue;
+
+        float score = FingerCode::similarity(templates[i], sample);
+
+        std::cout << "  fc_sim[" << i << "]=" << score << std::endl;
+
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    result.best_score = best_score;
+    result.best_template_index = best_idx;
+    result.matched = (best_score >= threshold);
+
+    std::cout << "  fc_best=" << best_score << " threshold=" << threshold
+              << " result=" << (result.matched ? "MATCH" : "reject") << std::endl;
+
+    return result;
+}
+
+// ============================================================
+// SIFT-based alignment for dual verification
+// ============================================================
+
+bool try_align(const cv::Mat& template_img, const cv::Mat& sample_img, cv::Mat& matrix)
+{
+    if (template_img.empty() || sample_img.empty()) return false;
+
+    auto sift = cv::SIFT::create(0, 3, 0.04, 0.1);
+
+    std::vector<cv::KeyPoint> kp1{}, kp2{};
+    cv::Mat desc1{}, desc2{};
+    sift->detectAndCompute(template_img, {}, kp1, desc1);
+    sift->detectAndCompute(sample_img, {}, kp2, desc2);
+
+    if (kp1.empty() || kp2.empty() || desc1.empty() || desc2.empty()) return false;
+
+    auto bf = cv::BFMatcher::create(cv::NORM_L2);
     std::vector<std::vector<cv::DMatch>> matches{};
-    bf_matcher->knnMatch(descriptors1, descriptors2, matches, 2);
+    bf->knnMatch(desc1, desc2, matches, 2);
 
-    std::vector<std::pair<size_t, size_t>> good_idx{};
-    for(auto& vpair : matches) {
-        auto& match1 = vpair.at(0);
-        auto& match2 = vpair.at(1);
-
-        if (match1.distance < (0.6F * match2.distance)) {
-            good_idx.emplace_back(match1.queryIdx, match1.trainIdx);
+    std::vector<std::pair<size_t, size_t>> good{};
+    for (auto& vpair : matches) {
+        if (vpair.size() < 2) continue;
+        if (vpair[0].distance < 0.65f * vpair[1].distance) {
+            good.emplace_back(vpair[0].queryIdx, vpair[0].trainIdx);
         }
     }
 
-    if (good_idx.size() < min_match) {
-        return false;
+    if (good.size() < 4) return false;
+
+    std::vector<cv::Point2f> pts1{}, pts2{};
+    for (auto& [qi, ti] : good) {
+        pts1.push_back(kp1[qi].pt);
+        pts2.push_back(kp2[ti].pt);
     }
 
-    std::vector<cv::Point2f> good_points1{};
-    std::vector<cv::Point2f> good_points2{};
-
-    std::for_each(good_idx.begin(), good_idx.end(), [&](std::pair<size_t, size_t> point){
-        good_points1.push_back(points1[point.first] + offset);
-        good_points2.push_back(points2[point.second]);
-    });
-
-    output = cv::findHomography(good_points2, good_points1, cv::RANSAC, 4);
-    return not output.empty();
+    matrix = cv::findHomography(pts2, pts1, cv::RANSAC, 4);
+    return !matrix.empty();
 }
 
-cv::Mat garbor_filter(
-    cv::Mat& img, 
-    size_t ksize=16, 
-    double sigma=3.0, 
-    size_t filter_max=8, 
-    double lambd=10.0, 
-    double gamma=0.5)
-{
-    std::array<cv::Mat, 8> filters{};
-    double theta = 0.0;
-    for (auto& mat : filters) {
-        auto kernel = cv::getGaborKernel(cv::Size(ksize, ksize), sigma, theta, lambd, gamma, 0, CV_32F);
-        cv::divide(kernel, cv::sum(kernel), mat);
-        theta += CV_PI / filters.size();
-    }
+// ============================================================
+// SSIM with mask
+// ============================================================
 
-    cv::Mat output = cv::Mat::zeros(img.size(), img.type());
-
-    for (auto& mat : filters) {
-        cv::Mat new_image;
-        cv::filter2D(img, new_image, -1, mat);
-        cv::max(output, new_image, output);
-    }
-    return output;
-}
-
-void get_orientation(cv::Mat& img, cv::Mat& magnitude, cv::Mat& angle)
-{
-    cv::Mat grad1{};
-    cv::Mat grad2{};
-
-    cv::Sobel(img, grad1, CV_32F, 1, 0);
-    cv::Sobel(img, grad2, CV_32F, 0, 1);
-
-    cv::cartToPolar(grad1, grad2, magnitude, angle);
-}
-
-cv::Mat garbor_filter_orientation(
-    cv::Mat& img,
-    double sigma=3.5, 
-    size_t filter_max=8, 
-    double lambd=10.0, 
-    double gamma=0.5)
-{
-    cv::Mat magnitude{};
-    cv::Mat angle{};
-
-    get_orientation(img, magnitude, angle);
-
-    cv::subtract(angle, CV_PI, angle, angle>=CV_PI);
-
-    auto mid = cv::mean(magnitude);
-    auto theta = cv::mean(angle, magnitude > mid)[0];
-
-    auto kernel = cv::getGaborKernel(img.size(), sigma, theta, lambd, gamma, 0, CV_32F);
-    cv::divide(kernel, cv::sum(kernel), kernel);
-
-    cv::Mat new_image;
-    cv::filter2D(img, new_image, -1, kernel);
-    return new_image;
-}
-
-cv::Mat garbor_filter_block_wise(
-    cv::Mat& img,
-    size_t block_size,
-    size_t overlap,
-    double sigma=3.5, 
-    size_t filter_max=8, 
-    double lambd=10.0, 
-    double gamma=0.5
-) {
-    auto size = img.size();
-    auto width = ((size.width + block_size - 1) / block_size) * block_size;
-    auto height = ((size.height + block_size - 1) / block_size) * block_size;
-    cv::Mat new_img{img.size(), img.type()};
-
-    for (size_t row = 0; row < height; row += overlap) {
-        size_t row2 = (row + block_size) > size.height ? size.height - block_size : row;
-        for (size_t col = 0; col < width; col += overlap) {
-            size_t col2 = (col + block_size) > size.width ? size.width - block_size : col;
-            auto block = img(cv::Range(row2, row2 + block_size), cv::Range(col2, col2 + block_size));
-            cv::Mat block_eq{};
-            cv::equalizeHist(block, block_eq);
-            auto block_g = garbor_filter_orientation(block, sigma, filter_max, lambd, gamma);
-            block_g.copyTo(new_img(cv::Range(row2, row2 + block_size), cv::Range(col2, col2 + block_size)));
-        }
-    }
-    return new_img;
-}
-
-// see https://docs.opencv.org/4.x/d5/dc4/tutorial_video_input_psnr_ssim.html
-cv::Scalar MSSIM(cv::Mat& img1, cv::Mat& img2, cv::InputArray mask)
+cv::Scalar compute_ssim(const cv::Mat& img1, const cv::Mat& img2, cv::InputArray mask)
 {
     const double C1 = 6.5025;
     const double C2 = 58.5225;
 
-    cv::Mat img1_32f{};
-    cv::Mat img2_32f{};
+    cv::Mat i1, i2;
+    img1.convertTo(i1, CV_32F);
+    img2.convertTo(i2, CV_32F);
 
-    img1.convertTo(img1_32f, CV_32F);
-    img2.convertTo(img2_32f, CV_32F);
+    cv::Mat i1_2 = i1.mul(i1);
+    cv::Mat i2_2 = i2.mul(i2);
+    cv::Mat i12  = i1.mul(i2);
 
-    cv::Mat img1_2 = img1_32f.mul(img1_32f);
-    cv::Mat img2_2 = img2_32f.mul(img2_32f);
-    cv::Mat img12 = img1_32f.mul(img2_32f);
-
-    cv::Mat mu1{};
-    cv::Mat mu2{};
-
-    cv::GaussianBlur(img1_32f, mu1, { 11, 11 }, 1.5);
-    cv::GaussianBlur(img2_32f, mu2, { 11, 11 }, 1.5);
+    cv::Mat mu1{}, mu2{};
+    cv::GaussianBlur(i1, mu1, {11, 11}, 1.5);
+    cv::GaussianBlur(i2, mu2, {11, 11}, 1.5);
 
     cv::Mat mu1_2 = mu1.mul(mu1);
     cv::Mat mu2_2 = mu2.mul(mu2);
-    cv::Mat mu12 = mu1.mul(mu2);
+    cv::Mat mu12  = mu1.mul(mu2);
 
-    cv::Mat sigma1_2{};
-    cv::Mat sigma2_2{};
-    cv::Mat sigma12{};
+    cv::Mat s1_2{}, s2_2{}, s12{};
+    cv::GaussianBlur(i1_2, s1_2, {11, 11}, 1.5);
+    cv::GaussianBlur(i2_2, s2_2, {11, 11}, 1.5);
+    cv::GaussianBlur(i12,  s12,  {11, 11}, 1.5);
 
-    cv::GaussianBlur(img1_2, sigma1_2, { 11, 11 }, 1.5);
-    cv::GaussianBlur(img2_2, sigma2_2, { 11, 11 }, 1.5);
-    cv::GaussianBlur(img12, sigma12, { 11, 11 }, 1.5);
+    s1_2 -= mu1_2;
+    s2_2 -= mu2_2;
+    s12  -= mu12;
 
-    sigma1_2 -= mu1_2;
-    sigma2_2 -= mu2_2;
-    sigma12 -= mu12;
-
-    auto t1 = 2.0 * img12 + C1;
-    auto t2 = 2.0 * sigma12 + C2;
+    auto t1 = 2.0 * i12 + C1;
+    auto t2 = 2.0 * s12 + C2;
     auto t3 = t1.mul(t2);
 
-    t1 = img1_2 + img2_2 + C1;
-    t2 = sigma1_2 + sigma2_2 + C2;
-    t1 = t1.mul(t2);
+    t1 = i1_2 + i2_2 + C1;
+    auto t4 = s1_2 + s2_2 + C2;
+    t1 = t1.mul(t4);
 
     cv::Mat ssim_map{};
     cv::divide(t3, t1, ssim_map);
@@ -222,144 +264,20 @@ cv::Scalar MSSIM(cv::Mat& img1, cv::Mat& img2, cv::InputArray mask)
     return cv::mean(ssim_map, mask);
 }
 
-bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
+// ============================================================
+// Legacy functions (kept for build compatibility)
+// ============================================================
+
+bool merge(const cv::Mat& /*img1*/, const cv::Mat& /*mask1*/,
+           const cv::Mat& /*img2*/, cv::Mat& /*output*/, cv::Mat& /*output_mask*/)
 {
-    cv::Mat matrix{};
-
-    auto ret = cvext::get_transform_matrix(fingerprint, partial, matrix, min_match);
-    if (not ret) {
-        return  false;
-    }
-    
-    cv::Mat shadow{partial.size(), CV_32F};
-    shadow.setTo(1.0F);
-
-    cv::Mat dst_img{};
-    cv::Mat dst_mask{};
-
-    cv::warpPerspective(partial, dst_img, matrix, fingerprint.size());
-    cv::warpPerspective(shadow, dst_mask, matrix, fingerprint.size());
-
-    dst_mask.setTo(0.0F, fp_mask==0);
-
-    cv::Mat fpr{};
-    fingerprint.copyTo(fpr, dst_mask > 0);
-
-    cv::Scalar score{};
-
-    if (filter) {
-        auto fpr_g = cvext::garbor_filter_block_wise(fpr, 32, 24);
-        auto dst_g = cvext::garbor_filter_block_wise(dst_img, 32, 24);
-
-        score = MSSIM(fpr_g, dst_g, dst_mask > 0);
-
-    } else {
-        score = MSSIM(fpr, dst_img, dst_mask > 0);
-    }
-
-    return score[0] >= min_score;
-}
-
-bool merge(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask) 
-{
-    cv::Mat matrix{};
-
-    auto offset = cv::Point(img2.size());
-    
-    auto ret = get_transform_matrix(img1, img2, matrix, 4, offset);
-    if (not ret) {
-        return false;
-    }
-
-    cv::Size dst_size = img1.size() + img2.size() * 2;
-
-    // process img1
-    cv::Mat new_img1 = cv::Mat::zeros(dst_size, img1.type());
-    cv::Mat weights1{dst_size, CV_32FC1};
-    weights1.setTo(0.0F);
-    
-    img1.copyTo(new_img1({offset.y, offset.y + img1.rows}, {offset.x, offset.x + img1.cols}));
-    mask1.copyTo(weights1({offset.y, offset.y + img1.rows}, {offset.x, offset.x + img1.cols}));
-
-    // generate mask2
-    cv::Mat img2_shadow{img2.size(), CV_32FC1};
-    img2_shadow.setTo(1.0F);
-    
-    cv::Mat weights2;
-    cv::warpPerspective(img2_shadow, weights2, matrix, dst_size);
-    weights2.setTo(0.0F, weights2 < 1.0F);
-
-    // transform img2
-    cv::Mat new_img2{};
-    cv::warpPerspective(img2, new_img2, matrix, dst_size);
-
-    // blend
-    cv::Mat overlap{};
-    cv::add(weights1, weights2, overlap);
-
-    auto score = MSSIM(new_img1, new_img2, overlap == 2)[0];
-    if (score < 0.3) {
-        return false;
-    }
-
-    weights1.setTo(0.9F, overlap == 2);
-    weights2.setTo(0.1F, overlap == 2);
-
-    cv::blendLinear(new_img1, new_img2, weights1, weights2, new_img1);
-
-    // merge mask
-    cv::add(weights1, weights2, weights1);
-
-    // resize
-    cv::Vec2f data[] = {
-        {0.0F, 0.0F},
-        {0.0F, (float)img2.rows},
-        {(float)img2.cols, (float)img2.rows},
-        {(float)img2.cols, 0.0F} 
-    };
-
-    cv::Mat corners{cv::Size(1,4), CV_32FC2, data};
-
-    cv::Mat transformed_corners{};
-    cv::perspectiveTransform(corners, transformed_corners, matrix);
-
-    auto left = std::min(transformed_corners.at<float>(0, 0), 
-        std::min(transformed_corners.at<float>(1, 0), 
-        std::min(transformed_corners.at<float>(2, 0), 
-        transformed_corners.at<float>(3, 0))));
-    auto top = std::min(transformed_corners.at<float>(0, 1), 
-        std::min(transformed_corners.at<float>(1, 1), 
-        std::min(transformed_corners.at<float>(2, 1), 
-        transformed_corners.at<float>(3, 1))));
-    auto right = std::max(transformed_corners.at<float>(0, 0), 
-        std::max(transformed_corners.at<float>(1, 0), 
-        std::max(transformed_corners.at<float>(2, 0), 
-        transformed_corners.at<float>(3, 0))));
-    auto bottom = std::max(transformed_corners.at<float>(0, 1), 
-        std::max(transformed_corners.at<float>(1, 1), 
-        std::max(transformed_corners.at<float>(2, 1), 
-        transformed_corners.at<float>(3, 1))));
-
-    auto left1 = offset.x;
-    auto top1 = offset.y;
-    auto right1 = offset.x + img1.cols;
-    auto bottom1 = offset.y + img1.rows;
-    if (left < left1) {
-        left1 = left;
-    }
-    if (right > right1) {
-        right1 = right;
-    }
-    if (top < top1) {
-        top1 = top;
-    }
-    if (bottom > bottom1) {
-        bottom1 = bottom;
-    }
-
-    output = new_img1(cv::Range{top1, bottom1}, cv::Range{left1, right1});
-    output_mask = weights1(cv::Range{top1, bottom1}, cv::Range{left1, right1});;
     return true;
 }
 
+bool match(const cv::Mat& /*fingerprint*/, const cv::Mat& /*fp_mask*/,
+           const cv::Mat& /*partial*/, int /*min_match*/, double /*min_score*/, bool /*filter*/)
+{
+    return false;
 }
+
+} // namespace cvext

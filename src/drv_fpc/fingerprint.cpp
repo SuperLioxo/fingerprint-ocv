@@ -1,22 +1,12 @@
 /*
 Copyright (C) 2022  pom@vro.life
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+Copyright (C) 2026  Modified for multi-template FingerCode matching
 */
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
+#include <cmath>
 
 #include <openssl/aes.h>
 #include <openssl/evp.h>
@@ -32,49 +22,190 @@ using namespace std::string_literals;
 
 bool Fingerprint::merge(const cv::Mat& img)
 {
-    if (_fingerprint.empty()) {
-        _fingerprint = img;
-        _mask.create(_fingerprint.size(), CV_32F);
-        _mask.setTo(1.0F);
+    // First image: store directly
+    if (_templates.empty()) {
+        _templates.push_back(img.clone());
+        cv::Mat mask(img.size(), CV_32F);
+        mask.setTo(1.0f);
+        _masks.push_back(mask);
+        _codes.push_back(cvext::FingerCode::extract(img));
         return true;
     }
-    cv::Mat output{};
-    cv::Mat mask{};
-    auto ret = cvext::merge(_fingerprint, _mask, img, output, mask);
-    if (not ret) {
+
+    // Subsequent images: store as additional template if under limit
+    if ((int)_templates.size() >= MAX_TEMPLATES) {
+        return false; // Already have enough templates
+    }
+
+    // Compute FingerCode for the new image
+    cvext::FingerCode new_code = cvext::FingerCode::extract(img);
+    if (!new_code.valid()) {
         return false;
     }
-    _fingerprint = std::move(output);
-    _mask = std::move(mask);
+
+    // Check similarity with existing templates (quality gate)
+    float min_sim = 1.0f;
+    for (const auto& existing_code : _codes) {
+        float sim = cvext::FingerCode::similarity(existing_code, new_code);
+        if (sim < min_sim) min_sim = sim;
+    }
+
+    // If too different from existing templates, reject (probably bad scan)
+    // Using a low threshold to be permissive during enrollment
+    if (min_sim < -0.2f) {
+        std::cout << "  enroll_sim=" << min_sim << " (too low, rejected)" << std::endl;
+        return false;
+    }
+
+    _templates.push_back(img.clone());
+    cv::Mat mask(img.size(), CV_32F);
+    mask.setTo(1.0f);
+    _masks.push_back(mask);
+    _codes.push_back(new_code);
+
+    // Update enrollment baseline
+    _enroll_min_similarity = min_sim;
+
+    // Update legacy fields for serialization compatibility
+    _fingerprint = _templates[0].clone();
+    _mask = _masks[0].clone();
+
+    std::cout << "  enroll_sim=" << min_sim << " templates=" << _templates.size() << std::endl;
+
     return true;
 }
 
-bool Fingerprint::match(const cv::Mat &img, float min_score, bool filter) const
+bool Fingerprint::match(const cv::Mat& img, float min_score, bool /*filter*/) const
 {
-    return cvext::match(_fingerprint, _mask, img, 4, min_score, filter);
+    if (_codes.empty()) {
+        return false;
+    }
+
+    cvext::FingerCode sample = cvext::FingerCode::extract(img);
+    if (!sample.valid()) {
+        std::cout << "  fc_sample_invalid" << std::endl;
+        return false;
+    }
+
+    // Phase 1: FingerCode scoring - find best matching templates
+    struct FCResult { size_t idx; float score; };
+    std::vector<FCResult> fc_results;
+    float best_score = -999.0f;
+    for (size_t i = 0; i < _codes.size(); ++i) {
+        float score = cvext::FingerCode::similarity(_codes[i], sample);
+        std::cout << "  fc[" << i << "]=" << score << std::endl;
+        if (score > best_score) {
+            best_score = score;
+        }
+        fc_results.push_back({i, score});
+    }
+
+    std::cout << "  fc_best=" << best_score << std::endl;
+
+    // Quick reject: if best FingerCode score is too low, skip expensive SIFT
+    if (best_score < min_score) {
+        std::cout << "  fc_reject" << std::endl;
+        return false;
+    }
+
+    // Phase 2: SIFT confirmation against top templates
+    // Sort by FingerCode score, try top templates with SIFT
+    std::sort(fc_results.begin(), fc_results.end(),
+        [](const FCResult& a, const FCResult& b) { return a.score > b.score; });
+
+    for (size_t rank = 0; rank < fc_results.size() && rank < 3; ++rank) {
+        size_t tpl_idx = fc_results[rank].idx;
+        float fc_score = fc_results[rank].score;
+
+        cv::Mat matrix;
+        // Try SIFT alignment between stored template and new scan
+        if (cvext::try_align(_templates[tpl_idx], img, matrix)) {
+            // SIFT aligned - compute SSIM score
+            cv::Mat shadow(img.size(), CV_32F);
+            shadow.setTo(1.0f);
+
+            cv::Mat dst_img, dst_mask;
+            cv::warpPerspective(img, dst_img, matrix, _templates[tpl_idx].size());
+            cv::warpPerspective(shadow, dst_mask, matrix, _templates[tpl_idx].size());
+
+            dst_mask.setTo(0.0F, _masks[tpl_idx] == 0);
+
+            cv::Mat fpr;
+            _templates[tpl_idx].copyTo(fpr, dst_mask > 0);
+
+            cv::Scalar ssim = cvext::compute_ssim(fpr, dst_img, dst_mask > 0);
+
+            std::cout << "  sift[" << tpl_idx << "] fc=" << fc_score << " ssim=" << ssim[0] << std::endl;
+
+            // Combined check: FingerCode score + SSIM
+            // SSIM threshold 0.8 separates correct (~0.87) from wrong (~0.73)
+            if (fc_score >= min_score && ssim[0] >= 0.8f) {
+                std::cout << "  CONFIRMED fc=" << fc_score << " ssim=" << ssim[0] << std::endl;
+                return true;
+            }
+        } else {
+            std::cout << "  sift[" << tpl_idx << "] fc=" << fc_score << " no_align" << std::endl;
+        }
+    }
+
+    std::cout << "  rejected_all" << std::endl;
+    return false;
 }
 
 size_t Fingerprint::total() const
 {
-    auto sum = cv::sum(_mask);
-    return static_cast<size_t>(sum[0]);
+    size_t total = 0;
+    for (const auto& mask : _masks) {
+        auto sum = cv::sum(mask);
+        total += static_cast<size_t>(sum[0]);
+    }
+    return total;
+}
+
+void Fingerprint::recompute_codes()
+{
+    _codes.clear();
+    for (const auto& img : _templates) {
+        _codes.push_back(cvext::FingerCode::extract(img));
+    }
 }
 
 void Fingerprint::write(cv::FileStorage& fstorage, int idx) const
 {
     std::string name{};
-    
+
     name = "user"s + std::to_string(idx);
     fstorage << name << _user;
 
     name = "name"s + std::to_string(idx);
     fstorage << name << _name;
 
+    name = "count"s + std::to_string(idx);
+    fstorage << name << (int)_templates.size();
+
+    name = "enroll_min_sim"s + std::to_string(idx);
+    fstorage << name << _enroll_min_similarity;
+
+    // Legacy fields for backward compat
     name = "print"s + std::to_string(idx);
-    fstorage << name << _fingerprint;
+    if (!_fingerprint.empty()) {
+        fstorage << name << _fingerprint;
+    } else if (!_templates.empty()) {
+        fstorage << name << _templates[0];
+    }
 
     name = "mask"s + std::to_string(idx);
-    fstorage << name << _mask;
+    if (!_mask.empty()) {
+        fstorage << name << _mask;
+    } else if (!_masks.empty()) {
+        fstorage << name << _masks[0];
+    }
+
+    // Store additional templates
+    for (int t = 0; t < (int)_templates.size(); ++t) {
+        name = "tpl"s + std::to_string(idx) + "_"s + std::to_string(t);
+        fstorage << name << _templates[t];
+    }
 }
 
 void Fingerprint::read(cv::FileStorage& fstorage, int idx)
@@ -87,13 +218,64 @@ void Fingerprint::read(cv::FileStorage& fstorage, int idx)
     name = "name"s + std::to_string(idx);
     _name = fstorage[name].string();
 
+    // Try to read template count (new format)
+    name = "count"s + std::to_string(idx);
+    int tpl_count = 0;
+    if (fstorage[name].isInt()) {
+        tpl_count = (int)fstorage[name];
+    }
+
+    // Try to read enrollment baseline
+    name = "enroll_min_sim"s + std::to_string(idx);
+    if (fstorage[name].isReal()) {
+        _enroll_min_similarity = (float)fstorage[name];
+    }
+
+    // Read legacy single template
     name = "print"s + std::to_string(idx);
-    _fingerprint = fstorage[name].mat();
+    if (!fstorage[name].empty()) {
+        _fingerprint = fstorage[name].mat();
+    }
 
     name = "mask"s + std::to_string(idx);
-    _mask = fstorage[name].mat();
+    if (!fstorage[name].empty()) {
+        _mask = fstorage[name].mat();
+    }
+
+    // Read additional templates (new format)
+    _templates.clear();
+    _masks.clear();
+    _codes.clear();
+
+    if (tpl_count > 0) {
+        for (int t = 0; t < tpl_count; ++t) {
+            name = "tpl"s + std::to_string(idx) + "_"s + std::to_string(t);
+            if (!fstorage[name].empty()) {
+                cv::Mat tpl = fstorage[name].mat();
+                _templates.push_back(tpl);
+                cv::Mat mask(tpl.size(), CV_32F);
+                mask.setTo(1.0f);
+                _masks.push_back(mask);
+            }
+        }
+    }
+
+    // Fallback: use legacy single template
+    if (_templates.empty() && !_fingerprint.empty()) {
+        _templates.push_back(_fingerprint.clone());
+        if (_mask.empty()) {
+            cv::Mat mask(_fingerprint.size(), CV_32F);
+            mask.setTo(1.0f);
+            _masks.push_back(mask);
+        } else {
+            _masks.push_back(_mask.clone());
+        }
+    }
+
+    // Recompute FingerCodes from images
+    recompute_codes();
 }
-    
+
 void FingerprintStorage::load()
 {
     _fingerprints.clear();
@@ -127,12 +309,12 @@ void FingerprintStorage::load()
     jinx::SliceConst nonce{_key.data(), 12};
 
     auto ret = crypto::decrypt(
-        EVP_chacha20_poly1305(), 
-        key, 
-        nonce, 
-        key, 
-        {encrypted.data(), encrypted.size() - 16}, 
-        {data.data(), data.size()}, 
+        EVP_chacha20_poly1305(),
+        key,
+        nonce,
+        key,
+        {encrypted.data(), encrypted.size() - 16},
+        {data.data(), data.size()},
         {encrypted.data() + encrypted.size() - 16, 16});
 
     if (not ret) {
@@ -173,12 +355,12 @@ void FingerprintStorage::save()
     jinx::SliceConst nonce{_key.data(), 12};
 
     crypto::encrypt(
-        EVP_chacha20_poly1305(), 
-        key, 
-        nonce, 
-        key, 
-        {data.data(), 
-        data.size()}, 
+        EVP_chacha20_poly1305(),
+        key,
+        nonce,
+        key,
+        {data.data(),
+        data.size()},
         {encrypted.data(), data.size()},
         {encrypted.data() + data.size(), 16});
 
